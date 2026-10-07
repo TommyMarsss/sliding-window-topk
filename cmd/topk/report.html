@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>滑动窗口 Top-K 回放报告</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2a3550;
+    --text: #e6ebf5; --dim: #8b96ad; --accent: #4f8cff; --warn: #ff5c6c;
+    --ok: #38c98e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; padding: 24px; }
+  h1 { font-size: 20px; font-weight: 600; }
+  h2 { font-size: 14px; font-weight: 600; color: var(--dim); margin-bottom: 10px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; }
+  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; font-size: 12px; color: var(--dim); }
+  .chip b { color: var(--text); font-weight: 600; }
+  .controls { display: flex; align-items: center; gap: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 18px; font-size: 13px; cursor: pointer; }
+  button.ghost { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .frame-label { font-variant-numeric: tabular-nums; color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .bars { position: relative; }
+  .row { position: absolute; left: 0; right: 0; height: 26px; display: flex; align-items: center; gap: 8px; transition: top .35s ease; }
+  .rank { width: 22px; text-align: right; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .name { width: 92px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-bg { flex: 1; height: 16px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar { height: 100%; border-radius: 4px; transition: width .35s ease; min-width: 2px; }
+  .cnt { width: 52px; font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .row.enter .name::after { content: " ↑"; color: var(--ok); }
+  .chart-panel { margin-top: 16px; }
+  canvas { width: 100%; display: block; }
+  .legend { display: flex; gap: 18px; font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+  .stats { display: flex; gap: 24px; margin-top: 8px; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .stats b { color: var(--text); }
+  .note { margin-top: 20px; color: var(--dim); font-size: 12px; line-height: 1.8; border-top: 1px solid var(--line); padding-top: 14px; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>滑动时间窗口 Top-K 频繁项 · 回放报告</h1>
+  <div class="chips" id="chips"></div>
+
+  <div class="controls">
+    <button id="play">▶ 播放</button>
+    <select id="speed">
+      <option value="1">1×</option>
+      <option value="2" selected>2×</option>
+      <option value="4">4×</option>
+      <option value="8">8×</option>
+    </select>
+    <input type="range" id="scrub" min="0" value="0">
+    <span class="frame-label" id="frameLabel"></span>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>精确 Top-K（增量维护，滑动窗口内真实计数）</h2>
+      <div class="bars" id="exactBars"></div>
+    </div>
+    <div class="panel">
+      <h2>近似 Top-K（分桶 Count-Min Sketch 估计，查询时计算）</h2>
+      <div class="bars" id="approxBars"></div>
+    </div>
+  </div>
+
+  <div class="panel chart-panel">
+    <h2>近似计数误差 vs 理论上界（ε·N）</h2>
+    <canvas id="errChart" height="180"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--accent)"></i>候选集最大误差 max |估计−真实|</span>
+      <span><i style="background:var(--warn)"></i>误差上界 ε·N</span>
+    </div>
+    <div class="stats" id="errStats"></div>
+  </div>
+
+  <div class="note">
+    <b>结构说明：</b>精确路径使用环形缓冲区保存窗口内事件，滑出事件逐个增量淘汰（O(1) 摊还），Top-K 由「小顶堆（Top-K 候选）+ 大顶堆（其余项）」双堆懒删除结构增量维护，每次计数变化 O(log K + log R)。
+    近似路径将窗口划分为等长时间桶，每桶一个独立的 Count-Min Sketch（深度 d=⌈ln(1/δ)⌉，宽度 w=⌈e/ε⌉），桶过期即整体清零复用；对任意项有 <code>真实 ≤ 估计 ≤ 真实 + ε·N</code>（置信度 ≥ 1−B·δ，B 为桶数，N 为窗口内事件数），误差不会随流长无界发散。
+  </div>
+</div>
+
+<script type="application/json" id="report-data">/*__REPORT_DATA__*/</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("report-data").textContent);
+const frames = DATA.frames;
+const K = DATA.k;
+const ROW_H = 30;
+
+// --- 参数 chips ---
+document.getElementById("chips").innerHTML = [
+  ["事件总数", DATA.events], ["窗口长度", DATA.window], ["K", DATA.k],
+  ["时间桶数 B", DATA.buckets], ["ε", DATA.eps], ["δ", DATA.delta],
+  ["词表大小", DATA.vocab], ["Zipf s", DATA.zipfS],
+  ["Sketch 内存", (DATA.cmsBytes / 1048576).toFixed(2) + " MiB（常量）"],
+  ["误差置信度", "≥ " + (1 - DATA.buckets * DATA.delta).toFixed(2)],
+].map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join("");
+
+// --- 条形图面板（按 item 持久化行，排名变化有过渡动画） ---
+function hashHue(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+function makePanel(elId) {
+  const el = document.getElementById(elId);
+  el.style.height = K * ROW_H + "px";
+  const rows = new Map(); // item -> {row, bar, cnt, rank}
+  return {
+    render(list) {
+      const max = list.length ? list[0].count : 1;
+      const seen = new Set();
+      list.forEach((ic, rank) => {
+        seen.add(ic.item);
+        let r = rows.get(ic.item);
+        if (!r) {
+          const row = document.createElement("div");
+          row.className = "row enter";
+          row.innerHTML = `<span class="rank"></span><span class="name"></span>` +
+            `<div class="bar-bg"><div class="bar"></div></div><span class="cnt"></span>`;
+          el.appendChild(row);
+          r = { row, bar: row.querySelector(".bar"), cnt: row.querySelector(".cnt"),
+                rankEl: row.querySelector(".rank"), nameEl: row.querySelector(".name") };
+          r.nameEl.textContent = ic.item;
+          r.bar.style.background = `hsl(${hashHue(ic.item)} 70% 55%)`;
+          rows.set(ic.item, r);
+          setTimeout(() => row.classList.remove("enter"), 900);
+        }
+        r.row.style.top = rank * ROW_H + "px";
+        r.rankEl.textContent = rank + 1;
+        r.bar.style.width = Math.max(1.5, (ic.count / max) * 100) + "%";
+        r.cnt.textContent = ic.count;
+      });
+      for (const [item, r] of rows) {
+        if (!seen.has(item)) { r.row.remove(); rows.delete(item); }
+      }
+    }
+  };
+}
+const exactPanel = makePanel("exactBars");
+const approxPanel = makePanel("approxBars");
+
+// --- 误差曲线 ---
+const chart = document.getElementById("errChart");
+const ctx = chart.getContext("2d");
+function drawChart(upto) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = chart.clientWidth, H = 180;
+  chart.width = W * dpr; chart.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 44, padR = 10, padT = 10, padB = 22;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  let maxY = 1;
+  for (const f of frames) maxY = Math.max(maxY, f.bound, f.maxErr);
+  maxY *= 1.08;
+  const x = i => padL + (i / (frames.length - 1)) * iw;
+  const y = v => padT + ih - (v / maxY) * ih;
+  // 网格与 Y 轴刻度
+  ctx.strokeStyle = "#2a3550"; ctx.fillStyle = "#8b96ad";
+  ctx.font = "10px ui-monospace, monospace"; ctx.textAlign = "right";
+  for (let g = 0; g <= 4; g++) {
+    const v = (maxY / 4) * g, yy = y(v);
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    ctx.fillText(v.toFixed(v < 10 ? 1 : 0), padL - 6, yy + 3);
+  }
+  // 上界（红色虚线，全程）
+  ctx.strokeStyle = "#ff5c6c"; ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.bound)) : ctx.moveTo(x(0), y(f.bound)));
+  ctx.stroke();
+  // 实际误差（蓝色，播放到当前帧）
+  ctx.strokeStyle = "#4f8cff"; ctx.setLineDash([]); ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i <= upto; i++) i ? ctx.lineTo(x(i), y(frames[i].maxErr)) : ctx.moveTo(x(0), y(frames[0].maxErr));
+  ctx.stroke();
+  // 当前位置游标
+  ctx.strokeStyle = "#8b96ad"; ctx.setLineDash([2, 3]);
+  ctx.beginPath(); ctx.moveTo(x(upto), padT); ctx.lineTo(x(upto), padT + ih); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// --- 回放控制 ---
+const scrub = document.getElementById("scrub");
+const playBtn = document.getElementById("play");
+const speedSel = document.getElementById("speed");
+const frameLabel = document.getElementById("frameLabel");
+const errStats = document.getElementById("errStats");
+scrub.max = frames.length - 1;
+let idx = 0, playing = false, timer = null;
+
+function render(i) {
+  idx = Math.max(0, Math.min(frames.length - 1, i));
+  const f = frames[idx];
+  exactPanel.render(f.exact);
+  approxPanel.render(f.approx);
+  scrub.value = idx;
+  frameLabel.textContent = `帧 ${idx + 1}/${frames.length} · 窗口 [${f.windowStart}, ${f.windowEnd}] · N=${f.n}`;
+  const ratio = f.bound > 0 ? (f.maxErr / f.bound * 100).toFixed(1) : "0.0";
+  errStats.innerHTML =
+    `<span>当前最大误差 <b>${f.maxErr}</b></span>` +
+    `<span>上界 ε·N <b>${f.bound.toFixed(1)}</b></span>` +
+    `<span>误差/上界 <b>${ratio}%</b></span>`;
+  drawChart(idx);
+}
+function tick() {
+  if (idx >= frames.length - 1) { pause(); return; }
+  render(idx + 1);
+}
+function play() {
+  playing = true; playBtn.textContent = "⏸ 暂停";
+  timer = setInterval(() => { for (let s = 0; s < +speedSel.value; s++) tick(); }, 100);
+}
+function pause() { playing = false; playBtn.textContent = "▶ 播放"; clearInterval(timer); }
+playBtn.onclick = () => { if (playing) pause(); else { if (idx >= frames.length - 1) render(0); play(); } };
+scrub.oninput = () => { pause(); render(+scrub.value); };
+window.addEventListener("resize", () => drawChart(idx));
+render(0);
+</script>
+</body>
+</html>
